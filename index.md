@@ -121,7 +121,7 @@ consider how to handle changes to existing schemas, additions of new schemas,
 and removals of old schemas, but also how to do so while minimizing 
 downtime for the user.
 
-#### Option A: Full Replacement (MVP)
+#### Option A: Full Replacement
 
 - Drop existing TAP_SCHEMA tables (Or drop TAP_SCHEMA entirely)
 - Recreate from scratch
@@ -169,38 +169,63 @@ full INSERTs, so this would require much more custom logic and risk of
 errors.
 
 
-#### Option C: Blue-Green Pattern (If Needed)
+#### Option C: Blue-Green Pattern (MVP)
 
-One additional option to consider is that we could maintain two sets of schema tables: `tap_schema` (active) and `tap_schema_staging` (update target). 
+Another option is following the blue-green pattern where we maintain two sets 
+of schema tables: 
 
-The flow would then be:
-- Update staging tables
-- Validate staging
-- Swap via table renaming
+- `tap_schema` (active) 
+- `tap_schema_staging` (inactive - updated during deployments) 
 
-This would potentially allow near-zero downtime updates, but would add 
-complexity and require more storage.
+**Update Flow:**
 
-Also, we'd have to clarify the story in terms of how existing connections 
-in a pool are pointed to the correct schema. It may be the case that this 
-is resolved automatically, but it is also possible that existing connections
-may continue to point to the old schema until they are recycled, either 
-through a restart of the TAP service or connection pool timeouts.
+1. **Load new version into staging**:
+   - Clear `tap_schema_staging` (DROP CASCADE + recreate, or DELETE all data)
+   - Populate `tap_schema_staging` with new schema metadata
+   - Validate staging
+
+2. **Atomic swap** (just rename, no DROP):
+```sql
+   BEGIN;
+   ALTER SCHEMA tap_schema RENAME TO tap_schema_temp;
+   ALTER SCHEMA tap_schema_staging RENAME TO tap_schema;
+   ALTER SCHEMA tap_schema_temp RENAME TO tap_schema_staging;
+   COMMIT;
+```
+   
+3. **Result**: 
+   - `tap_schema` now has new version (active)
+   - `tap_schema_staging` now has old version (available for instant rollback)
+
+**Rollback** (instant):
+```sql
+BEGIN;
+ALTER SCHEMA tap_schema RENAME TO tap_schema_temp;
+ALTER SCHEMA tap_schema_staging RENAME TO tap_schema;
+ALTER SCHEMA tap_schema_temp RENAME TO tap_schema_staging;
+COMMIT;
+```
+
+**This provides some advantages:**
+- Zero-downtime updates (only brief rename)
+- Instant rollback capability (just swap names again)
+
+Postgres should in theory clear existing connections to the old schema during the rename,
+so queries should be automatically routed to the new schema without requiring a restart of the TAP service.
+However this would need to be tested to confirm.
 
 #### Comparison of single transaction upgrade with DELETE vs blue-green
 
-In terms of service disruption, both approaches would likely result in now 
+In terms of service disruption, both approaches would likely result in no 
 downtime. However the single transaction would block queries for a brief period
-while the update is in progress. As for consistency, the single transaction
-ensures atomicity, while blue-green may have a brief period of inconsistency
-during the swap. Complexity-wise, single transaction is simpler to implement.
+while the update is in progress. Complexity-wise, single transaction is simpler to implement.
 A full replacement option would also use less storage compared to 
 the blue-green deployment has to at least temporarily have two copies, 
 although this probably is a minimal cost since the TAP_SCHEMA tables 
 shouldn't take up too much disk space.
 
-**Conclusion:** For MVP, the plan is to implement Option A (Full 
-Replacement) with a single transaction and observe performance of the updates.
+**Conclusion:** For MVP, the plan is to implement Option C (blue-green).
+This gives us a good balance of minimal downtime and simplicity.
 
 
 ### 4.2 Schema Distribution Methods
@@ -242,6 +267,21 @@ Commit the Felis YAML (or SQL) to the Phalanx Git repo, render them into a Confi
 
 **Cons:** ConfigMap size limits & probably clutters Phalanx repo
 
+
+**Option D:** Store release artifacts in GCS bucket and download from there.
+
+This would involve modifying the `sdm_schemas` CI/CD to upload the `schemas.tar.gz` 
+to a GCS bucket whenever a new release is created. 
+The Helm hook job would then download from this GCS bucket.
+The urls to the artifacts would be constructed based on the release version,
+and would be available publicly, and discoverable via Repertoire.
+
+**Pros:** More control over availability, no GitHub dependency
+
+**Cons:** Requires GCS bucket management, additional complexity
+
+For our MVP, the current plan is to implement Option D and download from GCS.
+
 ### 4.3 Update Script Logic
 
 The update script (`update-tap-schema.sh`) will perform the following operations:
@@ -272,7 +312,7 @@ Based on selected distribution method (see 4.2)
 
 For each schema in the configuration:
 - Validates the YAML file using Felis (`felis validate`)
-- Generates INSERT SQL using `felis load-tap-schema --dry-run --output-file`
+  - Generates INSERT SQL using `felis load-tap-schema --dry-run --output-file`
 - **Execute DELETE + INSERT in a single transaction** (see Section 4.9 for details)
   - Delete existing schema data from all TAP_SCHEMA tables
   - Execute generated INSERT SQL
@@ -701,36 +741,77 @@ The workaround suggested here is to use Felis in dry-run mode to generate SQL,
 then execute all SQL in a single script-managed transaction:
 
 ```bash
-# Phase 1: Generate SQL (no database changes)
+# Phase 1: Clear and repopulate staging
+psql <<EOF
+-- Clear staging (keep structure, delete data)
+DELETE FROM tap_schema_staging.key_columns;
+DELETE FROM tap_schema_staging.keys;
+DELETE FROM tap_schema_staging.columns;
+DELETE FROM tap_schema_staging.tables;
+DELETE FROM tap_schema_staging.schemas;
+EOF
+
+# Phase 2: Load new schemas into staging
 for schema in $SCHEMAS_TO_LOAD; do
     felis load-tap-schema \
-        --dry-run \
-        --output-file=/tmp/${schema}_insert.sql \
-        --engine-url=postgresql:// \
+        --engine-url=postgresql://${PGUSER}@${PGHOST}:${PGPORT}/${PGDATABASE} \
+        --tap-schema-name=tap_schema_staging \
         ${schema}.yaml
 done
 
-# Phase 2: Execute all changes in ONE transaction
+# Phase 3: Validate staging
+psql -c "SELECT COUNT(*) FROM tap_schema_staging.schemas WHERE schema_name IN ('dp02_dc2', 'apdb');"
+# (more validation tests)
+
+# Phase 4: Atomic three-way swap
 psql <<EOF
 BEGIN;
-
--- Delete + Insert for schema 1
-DELETE FROM tap_schema.schemas WHERE schema_name = 'schema1';
--- (other deletes...)
-\i /tmp/schema1_insert.sql
-
--- Delete + Insert for schema 2  
-DELETE FROM tap_schema.schemas WHERE schema_name = 'schema2';
--- (other deletes...)
-\i /tmp/schema2_insert.sql
-
+ALTER SCHEMA tap_schema RENAME TO tap_schema_temp;
+ALTER SCHEMA tap_schema_staging RENAME TO tap_schema;
+ALTER SCHEMA tap_schema_temp RENAME TO tap_schema_staging;
 COMMIT;
 EOF
 ```
 
 Essentially all schemas in `SCHEMAS_TO_LOAD` are updated within a single 
-`BEGIN`...`COMMIT` block, and if any schema fails to load, the entire 
-transaction is rolled back.
+`BEGIN`...`COMMIT` block.
+
+Only the schema rename operations are in a transaction (milliseconds) and data 
+loading happens outside transaction in staging schema, so there would be no 
+blocking of TAP service queries during data load.
+
+The above describes the blue-green approach (Option C in Section 4.1).
+If we eventually instead choose to do a full replacement the above would essentially
+be simpler as we would not need to create the staging schema and could just
+delete the existing schema data directly from `tap_schema` before inserting the new data.
+
+
+
+### 4.9 Felis Docker Image
+
+For the Helm hook job, we would need a container image with Felis installed.
+This should be created via Github actions and pushed to GHCR.
+
+### 4.10 Managing Datalink templates
+
+Currently, the datalink template files (datalink-snippets) are packaged into a 
+tarball and then the TAP service fetches them at startup from github.
+With the new architecture, the current plan is that these templates would 
+be pushed to GCS as part of the release. Repertoire through some process to 
+be determined would know where these are located based on the schema 
+version and store the URLS to them along with the URL to the schema files.
+
+The TAP service could then request the link to the datalink template files from
+Repertoire and fetch them at startup, instead of storing a link to the 
+datalink payload URL as it does now.
+
+There is potentially some room for improvement here in terms of how we handle
+the datalinks in TAP through this template mechanism, as ideally we want 
+better separation between the schema definitions and any other products 
+like the datalink template files. 
+
+However this is out of scope for this document, and may be something to consider in the future and 
+outlined in it's own technote.
 
 ---
 
@@ -750,6 +831,8 @@ If future requirements show the need for complete separation, the `tap_schema` s
    - Database tap and schema for `tap_schema`
    - Service accounts
    - Workload Identities
+2. Verify service account has CREATE/DROP SCHEMA permissions on `tap` database
+3. No new CloudSQL instance needed - reusing existing
 
 **Deliverables:**
 - Terraform configuration (Not obvious if anything needs to be changed)
@@ -779,47 +862,38 @@ If future requirements show the need for complete separation, the `tap_schema` s
 
 ```bash
 
-Parse configuration - Read SCHEMA_VERSION, SCHEMAS_TO_LOAD, and other environment variables
+Parse configuration - Read SCHEMA_VERSION, SCHEMAS_TO_LOAD
 
-Fetch schema files - Download schemas.tar.gz from GitHub release (or read from baked-in container)
+Fetch schema files - Download from GCS
 
-Initialize TAP_SCHEMA - Run felis init-tap-schema if tables don't exist 
+Initialize schemas (first time only):
+    felis init-tap-schema --tap-schema-name=tap_schema
+    felis init-tap-schema --tap-schema-name=tap_schema_staging
 
-Validate all schemas - Run felis validate on each YAML file; exit if any validation fails
+Validate all schemas - Run felis validate on each YAML file
 
-Generate INSERT SQL for ALL schemas:
-    For each schema:
-        felis load-tap-schema --dry-run --output-file=/tmp/${schema}_insert.sql
+Clear staging schema:
+    DELETE all rows from tap_schema_staging tables
 
-Execute single transaction for ALL schemas:
-    BEGIN TRANSACTION
-        For each schema in SCHEMAS_TO_LOAD:
-            # Delete existing data for this schema
-            DELETE FROM tap_schema.key_columns WHERE key_id IN (...)
-            DELETE FROM tap_schema.keys WHERE from_table LIKE 'schema.%'
-            DELETE FROM tap_schema.columns WHERE table_name LIKE 'schema.%'
-            DELETE FROM tap_schema.tables WHERE schema_name = 'schema'
-            DELETE FROM tap_schema.schemas WHERE schema_name = 'schema'
-            
-            # Insert new data for this schema
-            EXECUTE SQL FROM /tmp/${schema}_insert.sql
-    COMMIT TRANSACTION
+Load into staging:
+    For each schema in SCHEMAS_TO_LOAD:
+        felis load-tap-schema --tap-schema-name=tap_schema_staging schema.yaml
 
-Cleanup old schemas (optional) - Delete schemas from database that aren't in SCHEMAS_TO_LOAD
-
-
-Run validation tests:
-
-    Verify all expected schemas exist
-
+Validate staging:
+    Verify all expected schemas exist in tap_schema_staging
     Verify each schema has tables
-
     Check foreign key integrity
 
+Atomic swap:
+    BEGIN TRANSACTION
+        ALTER SCHEMA tap_schema RENAME TO tap_schema_temp
+        ALTER SCHEMA tap_schema_staging RENAME TO tap_schema
+        ALTER SCHEMA tap_schema_temp RENAME TO tap_schema_staging
+    COMMIT TRANSACTION
 
-Report results - Log success/failure summary and current TAP_SCHEMA contents
+Report results
 
-Exit - Return 0 if all succeeded, 1 if any failed
+Exit - Return 0 if succeeded, 1 if failed
 
 ```
 
@@ -928,9 +1002,38 @@ tap:
 If issues occur after a schema update, we can rollback using GitOps via a 
 rollback or a git revert + sync. By syncing to a previous version, the Helm hook job will run again 
 and reload the previous schema version. The previous schema version's 
-GitHub release (or docker image dending on which approach we go with) must 
+GitHub release (or docker image depending on which approach we go with) must 
 still exist. If for whatever reason the previous version is not available 
 the option is also there to manually restore schema from CloudSQL backup.
+
+In the case of blue-green deployment we also have the option of swapping
+the schema names in the database, since we can keep the previous version 
+after a new deploy around. However this would be a manual process (or at 
+best some script we can run manually) and not part of the automated
+Helm hook job, unless we have some sort of flag to indicate a rollback.
+
+**GitOps Rollback:**
+
+1. Revert `schemaVersion` in Phalanx
+2. ArgoCD sync reruns Helm hook
+3. Job reloads old version from GCS into staging
+4. Swap completes
+
+**Instant Rollback using staging schema(Primary Method):**
+
+Since we maintain both schemas permanently, rollback could also be done via:
+```bash
+psql <<EOF
+BEGIN;
+ALTER SCHEMA tap_schema RENAME TO tap_schema_temp;
+ALTER SCHEMA tap_schema_staging RENAME TO tap_schema;
+ALTER SCHEMA tap_schema_temp RENAME TO tap_schema_staging;
+COMMIT;
+EOF
+```
+
+The current plan is to use the GitOps rollback as the primary method, and 
+we can always revisit and add the instant swap method later if needed.
 
 ---
 
@@ -955,6 +1058,8 @@ permissions on the tap_schema tables.
 ### Transaction Size
 Our current design wraps all schemas in a single transaction. 
 Are we concerned about transaction size and potential timeouts? TAP service queries against TAP_SCHEMA might be blocked during the entire update?
+Note: This question is only relevant if we choose the single transaction approach instead of blue-green.
+
 
 ### Schema Distribution
 How should the job updater get the schema files? Download from GitHub? Bake into a container image? Mount from ConfigMap?
@@ -972,10 +1077,6 @@ I'd probably aim for full replacement for MVP, implement incremental updates as 
 Do we want to maintain schema version history in the database or record the schema version in the database somehow or does 
  that add unnecessary complexity?
 
-### Blue-Green Deployment
-Do we want to implement a blue-green deployment pattern for TAP_SCHEMA updates?
-I'd think not for MVP but consider as future enhancement if transaction 
-time is too long.
 
 ---
 
