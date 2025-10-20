@@ -851,7 +851,7 @@ tarball and then the TAP service fetches them at startup from github.
 With the new architecture, the current plan is that these templates would 
 be pushed to GCS as part of the release.
 
-[Repertoire](https://repertoire.lsst.io/) will be configured with a list of SQL databases (Cloud SQL when running at Google) for where the TAP schemas are written, and will conned to those databases to read the version (from the `versions` table) of the deployed schemas.
+[Repertoire](https://repertoire.lsst.io/) will be configured with a list of SQL databases (Cloud SQL when running at Google) for where the TAP schemas are written, and will connect to those databases to read the version (from the `versions` table) of the deployed schemas.
 With that version information and additional Phalanx configuration setting the base path of the GCS bucket into which templates and metadata will be published, Repertoire can then construct the URLs for the corresponding metadata and include them in service discovery.
 
 The TAP schemas for each TAP server, and therefore the corresponding versions and URLs, may be different, so Repertoire's service discovery information must include a dictionary of different TAP services to version information and links to the relevant metadata.
