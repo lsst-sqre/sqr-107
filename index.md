@@ -6,10 +6,11 @@ This image is deployed as a separate deployment (`tap-schema-db`) alongside the 
 This approach requires rebuilding and pushing Docker images for every
 schema change, couples schema updates to application deployments, and results in ephemeral schema storage that is lost on pod restarts.
 
-**Proposed Solution:** Migrate TAP_SCHEMA to a persistent CloudSQL instance, where Felis loads the schema metadata directly via a Kubernetes Job triggered by Helm hooks during our regular updates via ArgoCD.
+**Proposed Solution:** Migrate TAP_SCHEMA to a persistent CloudSQL instance, where Felis loads the schema metadata directly via a Kubernetes Job triggered by Helm hooks in the Repertoire application during Repertoire deployments via ArgoCD.
 
-This architecture simplifies schema management by eliminating the containerized TAP_SCHEMA database pod and removing the Docker image build cycle for schema updates. Instead of rebuilding containers for every schema change, a lightweight Helm hook job loads YAML schema definitions directly to CloudSQL during ArgoCD deployments. The TAP service connects to CloudSQL for schema metadata, gaining better backup, recovery, and monitoring capabilities. Although schema updates still flow through Phalanx (by updating schemaVersion), we improve the maintenance overhead and get less coupling between the tap application and the TAP_SCHEMA database.
-
+This architecture simplifies schema management by eliminating the containerized TAP_SCHEMA database pod and removing the Docker image build cycle for schema updates. Instead of rebuilding containers for every schema change, a lightweight Helm hook job in Repertoire loads YAML schema definitions directly to CloudSQL during Repertoire deployments via ArgoCD. The TAP service connects to CloudSQL for schema metadata queries at runtime, gaining better backup, recovery, and monitoring capabilities. Schema version configuration is managed by Repertoire, which serves as the single source of truth for TAP_SCHEMA versions and metadata URLs. 
+This improves maintenance overhead and decouples TAP service deployments from schema updates.
+ 
 **Scope:** This architecture applies to both the QServ and the Postgres backed TAP services (tap & ssotap applications).
 ```
 
@@ -42,26 +43,6 @@ prepopulate the image with TAP_SCHEMA metadata. This image is deployed as a sepa
 - Build script: `sdm_schemas/tap-schema/build-all`
 - Output: Docker image with pre-populated TAP_SCHEMA database
 
-#### TAP DataLink Templates
-
-If certain database columns are included in a TAP result, that result should contain additional service descriptors that point the user to other services that may be used in combination with that data.
-This addition is done by the TAP server when constructing the result footer, but the metadata and templates for what service descriptors to include is maintained in sdm_schemas in the `datalink` directory.
-That metadata needs to be available to the TAP server and match the current TAP schema.
-
-- Source: `sdm_schemas/datalink/*.xml` and `sdm_schemas/datalink/*.json` files (https://github.com/lsst/sdm_schemas)
-- Tool: `sdm-tools build-datalink-metadata` (https://github.com/lsst/sdm_tools)
-- Output: `datalink-snippets.zip` included in the sdm_schemas release artifacts
-
-#### TAP Column Metadata
-
-Some services that wrap TAP queries need to know what sets of columns to include in their results and how to order those columns.
-This metadata is derived from the table schemas maintained in sdm_schemas.
-That derived metadata needs to be made available to those services.
-
-- Source: `sdm_schemas/yml/*.yaml` files (https://github.com/lsst/sdm_schemas)
-- Tool: `sdm-tools build-datalink-metadata` (https://github.com/lsst/sdm_tools)
-- Output: `datalink-columns.zip` included in the sdm_schemas release artifacts
-
 ### 2.2 Problems with Current Approach
 
 The current containerized approach creates unnecessary friction in schema 
@@ -72,12 +53,6 @@ what is essentially metadata changes.
 Also container storage is ephemeral, meaning schema data is lost on pod 
 restarts and lacks the backup & recovery, logging and monitoring 
 and robustness capabilities of CloudSQL databases. 
-
-The URLs to the current DataLink templates and TAP column metadata have to be updated separately from the version of the schema Docker images and is often not kept up-to-date, even though that data is maintained together and should be kept in sync.
-
-The TAP server and the datalinker server download ZIP files from GitHub on startup and unpack them in a local writable directory, which means the services have to be restarted for metadata updates, part of the local image has to be writable (not ideal for security), and frequent restarts could result in GitHub rate limiting.
-
-There is no easy way for Science Platform services to know what version of the TAP schemas and supporting metadata is in use at runtime so that it can be checked for inconsistencies, reported in debugging output, etc.
 
 ---
 
@@ -91,9 +66,14 @@ There is no easy way for Science Platform services to know what version of the T
 
 **Helm Hook Automation**: Trigger schema updates automatically during ArgoCD deployments
 
+**Schema Management**: Repertoire owns schema version configuration and 
+loading.
+
 **Metadata Publication**: Metadata about a schema release is published to some public versioned URL as part of the release process
 
-**Versioning and Discovery**: The deployed version of the schema is recorded in the database and available from service discovery along with the corresponding links to published metadata
+**Versioning and Discovery**: The deployed version of the schema is recorded 
+in the database and available from service discovery along with the corresponding links to published metadata
+
 
 ### 3.2 TAP_SCHEMA Structure
 
@@ -108,42 +88,30 @@ tap_schema.keys        -- Foreign key relationships
 tap_schema.key_columns -- Columns involved in foreign keys
 ```
 
-We will add a `versions` table that contains the version number of the published schema.
-
 **How Felis Populates These:**
 
 Felis populates these by reading the YAML schema definition (e.g., `yml/dp02_dc2.yaml`), converting to TAP_SCHEMA INSERT/UPDATE statements which in the current setup are written as .sql scripts which are then mounted and executed during startup of the database pod.
 
-### 3.3 Metadata Publication
-
-On sdm_schemas release or ticket branch build, its GitHub Actions will publish the metadata generated by `sdm-tools build-datalink-metadata` to a public Google Cloud Storage bucket in addition to the existing release artifacts.
-The path within that bucket will start with the version number or ticket branch tag, followed by the current file names (`w.2025.36/datalink-snippets.zip`, for example).
-
-### 3.4 Service Discovery Integration
-
-To expose the TAP schema version through service discovery, [Repertoire](https://repertoire.lsst.io) will be granted access to the Cloud SQL databases for the various TAP services.
-It will connect to the database and read the `versions` table to determine the currently deployed schema version and include that in service discovery results.
-
-Repertoire will also use that version information to construct URLs to the TAP DataLink templates and additional TAP metadata.
-The services that need to download that data (currently the TAP servers and datalinker) will then query service discovery for those URLs and retrieve the data from those URLs.
-We will continue to do this at startup or on first use for now, but the code will be written to allow for checking and updating a local cache at runtime in the future.
-
 ### 3.3 Proposed Architecture Diagram
 
 ```
-[Developer] → [sdm_schemas repo] → [GitHub Release v1.2.4] → [GCS bucket]
+[Developer] → [sdm_schemas repo] → [GitHub Release v1.2.4]
                                            ↓
-[Phalanx values.yaml] ← [Manual PR] ← [schemaVersion: v1.2.4]
+[Phalanx repertoire/values.yaml] ← [Manual PR] ← [schemaVersion: v1.2.4]
          ↓
-    [ArgoCD Sync]
+    [ArgoCD Sync (Repertoire)]
          ↓
     [Helm pre-upgrade hook]
          ↓
     [Job: felis-updater] → [CloudSQL Proxy] → [CloudSQL: tap_schema DB]
          ↓
+    [Repertoire Service] ← [CloudSQL Proxy] ← [CloudSQL: tap_schema DB]
+         ↓
     [TAP Service Deployment] → [CloudSQL Proxy] → [CloudSQL: tap_schema + uws DBs]
-         ↑               ↑                        ↓
-     [GCS Bucket]   [Repertoire]  ←  [CloudSQL Proxy]
+         ↑                           ↑
+    [Repertoire API]            [GCS Bucket]
+     (metadata URLs)           (datalink templates)
+
 ```
 
 ```{figure} diagram.png
@@ -152,6 +120,22 @@ We will continue to do this at startup or on first use for now, but the code wil
 
 Proposed Architecture Diagram
 ```
+
+
+### 3.4 Why Repertoire?
+
+Moving schema version management and the loading mechanism to Repertoire 
+provides several architectural benefits.
+
+Managing the schema version in Repertoire creates a natural single source 
+of truth, as Repertoire is already responsible for service discovery and
+metadata publication for TAP services. This ensures that the schema version
+reported by Repertoire always matches what is actually loaded in CloudSQL.
+
+TAP service deployments are fully decoupled from schema updates and all 
+schema-related metadata (versions, datalink templates, column metadata) 
+flows through Repertoire's service discovery API and the TAP service is 
+thus only a consumer of this metadata.
 
 ---
 
@@ -394,24 +378,25 @@ then this step is not needed.
 
 ### 4.4 Helm Hook Implementation
 
-We'll use Helm hooks to trigger schema updates, following the pattern used by other Phalanx apps like `wobbly`.
+We'll use Helm hooks in the Repertoire application to trigger schema updates, following the pattern used by other Phalanx apps like `wobbly`.
 
 Rough draft of the Job template:
 
 ```yaml
-# File: phalanx/charts/cadc-tap/templates/job-schema-update.yaml
+
+# File: phalanx/applications/repertoire/templates/job-schema-update.yaml
 
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: tap-schema-update-{{ .Values.tapSchema.schemaVersion | replace "." "-" }}
+  name: repertoire-schema-update-{{ .Values.tapSchema.schemaVersion | replace "." "-" }}
   namespace: {{ .Release.Namespace }}
   annotations:
     helm.sh/hook: "pre-install,pre-upgrade"
     helm.sh/hook-delete-policy: "before-hook-creation"
     helm.sh/hook-weight: "-5"
   labels:
-    {{- include "cadc-tap.labels" . | nindent 4 }}
+    {{- include "repertoire.labels" . | nindent 4 }}
     app.kubernetes.io/component: "schema-update"
 spec:
   ttlSecondsAfterFinished: 86400
@@ -419,17 +404,17 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "cadc-tap.selectorLabels" . | nindent 8 }}
+        {{- include "repertoire.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: "schema-update"
     spec:
-      serviceAccountName: {{ include "cadc-tap.serviceAccountName" . }}
+      serviceAccountName: {{ include "repertoire.serviceAccountName" . }}
       restartPolicy: OnFailure
       
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
-      
+        fsGroup: 1000
       containers:
       - name: felis-updater
         image: ghcr.io/lsst/felis:{{ .Values.tapSchema.felisVersion | default "1.0.0" }}
@@ -450,12 +435,14 @@ spec:
           value: {{ .Values.tapSchema.schemas | join "," | quote }}
         - name: CLEANUP_OLD_SCHEMAS
           value: {{ .Values.tapSchema.cleanupOldSchemas | default "false" | quote }}
-        
+        - name: GCS_BUCKET
+          value: {{ .Values.tapSchema.gcsBucket | default "rubin-tap-schemas" | quote }}
+        - name: GCS_BASE_PATH
+          value: {{ .Values.tapSchema.gcsBasePath | default "schemas" | quote }}
         volumeMounts:
         - name: update-script
           mountPath: /scripts
           readOnly: true
-        
         resources:
           requests:
             memory: "512Mi"
@@ -468,7 +455,7 @@ spec:
           allowPrivilegeEscalation: false
           capabilities:
             drop:
-              - all
+            - all
           readOnlyRootFilesystem: true
       
       # Cloud SQL Proxy sidecar
@@ -488,7 +475,7 @@ spec:
           allowPrivilegeEscalation: false
           capabilities:
             drop:
-              - all
+            - all
           readOnlyRootFilesystem: true
         
         resources:
@@ -497,7 +484,7 @@ spec:
       volumes:
       - name: update-script
         configMap:
-          name: tap-schema-update-script
+          name: {{ include "repertoire.fullname" . }}-schema-update-script
           defaultMode: 0755
 ```
 
@@ -517,9 +504,25 @@ spec:
 
 ### 4.5 Phalanx Configuration
 
-#### Values File Structure
+#### Values File Structure in Repertoire
 
-(Ommmitting unchanged sections for conciseness)
+Note, the actual configuration structure is to be determined, but the 
+following shows a rough draft of the necessary configuration options.
+
+```yaml
+# applications/repertoire/values.yaml (base configuration)
+
+
+tapSchema:
+  # Schema version management is now in Repertoire
+  schemaVersion: "v1.2.3"
+  felisVersion: "1.0.0"
+  schemas:
+    - dp02_dc2
+    - dp1
+  cleanupOldSchemas: false
+  cloudSqlDatabase: "tap_schema" 
+```
 
 ```yaml
 # applications/tap/values.yaml (base configuration)
@@ -544,12 +547,6 @@ uws:
 tapSchema:
   useCloudSQL: true
   cloudSqlDatabase: "tap_schema"
-  schemaVersion: "v1.2.3"
-  felisVersion: "1.0.0"
-  schemas:
-    - dp02_dc2
-    - apdb
-  cleanupOldSchemas: false
 
   # Keep legacy image config for cases where CloudSQL is not enabled
   image:
@@ -566,7 +563,7 @@ schemas loaded. The idea proposed here is to allow each env to specify which
 schemas to load in their respective values files.
 
 ```yaml
-# applications/tap/values-idfint.yaml
+# applications/repertoire/values-idfint.yaml
 tapSchema:
   schemaVersion: "v1.2.4"
   
@@ -623,6 +620,8 @@ spec:
         - name: TAP_SCHEMA_JDBC_URL
           value: "jdbc:postgresql://127.0.0.1:5432/{{ .Values.tapSchema.cloudSqlDatabase }}"
         {{- else }}
+        - name: REPERTOIRE_URL
+          value: "http://repertoire.{{ .Release.Namespace }}.svc.cluster.local"
         - name: TAP_SCHEMA_JDBC_URL
           value: "jdbc:mysql://{{ .Values.config.tapSchemaAddress }}"
         {{- end }}
@@ -664,18 +663,22 @@ spec:
 ```
 
 ```yaml
-# applications/tap/templates/configmap-update-script.yaml
+# applications/repertoire/templates/configmap-update-script.yaml
+
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: tap-schema-update-script
+  name: repertoire-schema-update-script
   namespace: {{ .Release.Namespace }}
 data:
   update-tap-schema.sh: |
 {{ .Files.Get "files/update-tap-schema.sh" | indent 4 }}
 ```
 
-**Note:** The tap-schema-db deployment and related resources in the cadc-tap chart need to be optional and disabled when CloudSQL is enabled for the tapSchema database.
+
+**Note**: 
+The tap-schema-db deployment and related resources in the cadc-tap chart need to be optional and disabled when CloudSQL is enabled for the tapSchema database.
+Repertoire needs CloudSQL proxy configuration in its deployment for reading tap_schema to construct service discovery responses.
 
 **Single CloudSQL Instance:** The plan is to use one CloudSQL instance that hosts both `uws` and `tap_schema` databases so the above changes reflect that. If for some reason we need separate instances we can adjust accordingly in the future.
 
@@ -849,17 +852,13 @@ This should be created via Github actions and pushed to GHCR.
 Currently, the datalink template files (datalink-snippets) are packaged into a 
 tarball and then the TAP service fetches them at startup from github.
 With the new architecture, the current plan is that these templates would 
-be pushed to GCS as part of the release.
+be pushed to GCS as part of the release. Repertoire through some process to 
+be determined would know where these are located based on the schema 
+version and store the URLS to them along with the URL to the schema files.
 
-[Repertoire](https://repertoire.lsst.io/) will be configured with a list of SQL databases (Cloud SQL when running at Google) for where the TAP schemas are written, and will connect to those databases to read the version (from the `versions` table) of the deployed schemas.
-With that version information and additional Phalanx configuration setting the base path of the GCS bucket into which templates and metadata will be published, Repertoire can then construct the URLs for the corresponding metadata and include them in service discovery.
-
-The TAP schemas for each TAP server, and therefore the corresponding versions and URLs, may be different, so Repertoire's service discovery information must include a dictionary of different TAP services to version information and links to the relevant metadata.
-
-The TAP service will then request the link to the datalink template files
-from Repertoire and fetch them (at startup at first, maybe dynamically
-later), instead of storing a link to the datalink payload URL as it does
-now.
+The TAP service could then request the link to the datalink template files from
+Repertoire and fetch them at startup, instead of storing a link to the 
+datalink payload URL as it does now.
 
 There is potentially some room for improvement here in terms of how we handle
 the datalinks in TAP through this template mechanism, as ideally we want 
@@ -868,6 +867,22 @@ like the datalink template files.
 
 However this is out of scope for this document, and may be something to consider in the future and 
 outlined in it's own technote.
+
+### 4.11 TAP Service Integration
+
+With schema management moved to Repertoire, the TAP service's role 
+simplifies to consuming schemas and metadata.
+
+TAP service continues to connect to CloudSQL TAP_SCHEMA via CloudSQL proxy 
+and the TAP service has no awareness of schema versions or how schemas are 
+loaded.
+
+In terms of metadata discovery, the TAP service queries Repertoire's service 
+discovery API for metadata URLs, specifically the datalink templates, which 
+it then fetches from GCS using URLs provided by Repertoire. 
+
+With this design the TAP service deployments are completely decoupled from schema updates
+and schema changes only require Repertoire redeployment.
 
 ---
 
@@ -892,7 +907,7 @@ If future requirements show the need for complete separation, the `tap_schema` s
 
 **Deliverables:**
 - Terraform configuration (Not obvious if anything needs to be changed)
-- Service accounts configured (May re-use existing)
+- Service accounts configured for both TAP and Repertoire (May re-use existing)
 
 
 
@@ -962,12 +977,15 @@ scratch, the script becomes simpler.
 **Objective:** Update Helm charts and configuration
 
 **Tasks:**
-1. Update TAP application values files
-2. Create Helm hook Job template
-3. Create ConfigMap for update script
-4. Update deployment templates for CloudSQL connectivity
-5. Make tap-schema-db deployment conditional/optional
-6. Test in on dev / int environments
+1. Update Repertoire application values files with tapSchema configuration
+2. Create Helm hook Job template in Repertoire chart
+3. Create ConfigMap for update script in Repertoire chart
+4. Update Repertoire deployment templates for CloudSQL connectivity (for 
+   reading tap_schema)
+5. Update TAP application values files (remove schema version management)
+6. Update TAP deployment to query Repertoire for metadata URLs
+7. Make tap-schema-db deployment conditional/optional
+8. Test in on dev / int environments
 
 **Deliverables:**
 - Updated Helm charts
@@ -1027,7 +1045,7 @@ felis validate --check-description yml/dp02_dc2.yaml
 Example: tag v1.2.3
 
 4. Update Phalanx
-In phalanx, change applications/tap/values-idfdev.yaml
+In phalanx, change applications/repertoire/values-idfdev.yaml
 Change: schemaVersion: "v1.2.3" then commit/push/PR
 
 5. ArgoCD syncs and runs update job automatically
@@ -1042,7 +1060,7 @@ Change: schemaVersion: "v1.2.3" then commit/push/PR
 Update only specific schemas without changing version:
 
 ```yaml
-# In values file, change which schemas are loaded
+# In the Repertoire values file, change which schemas are loaded
 tap:
   schemaVersion: "v1.2.4"
   schemas:
@@ -1102,10 +1120,11 @@ so no password management is required.
 
 ### 7.2 Database Roles
 
-The current design grants the felis-updater job full access to the tap_schema database. 
+The current design grants Repertoire's felis-updater job full access to the tap_schema database.
 We should probably consider two roles here, a **reader role** used by the TAP 
 service and a **writer role** used by the felis-updater job with full CRUD 
 permissions on the tap_schema tables.
+Repertoire also needs read access to tap_schema to query the versions table and construct service discovery responses.
 
 ---
 
