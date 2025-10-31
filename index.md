@@ -8,7 +8,10 @@ schema change, couples schema updates to application deployments, and results in
 
 **Proposed Solution:** Migrate TAP_SCHEMA to a persistent CloudSQL instance, where Felis loads the schema metadata directly via a Kubernetes Job triggered by Helm hooks in the Repertoire application during Repertoire deployments via ArgoCD.
 
-This architecture simplifies schema management by eliminating the containerized TAP_SCHEMA database pod and removing the Docker image build cycle for schema updates. Instead of rebuilding containers for every schema change, a lightweight Helm hook job in Repertoire loads YAML schema definitions directly to CloudSQL during Repertoire deployments via ArgoCD. The TAP service connects to CloudSQL for schema metadata queries at runtime, gaining better backup, recovery, and monitoring capabilities. Schema version configuration is managed by Repertoire, which serves as the single source of truth for TAP_SCHEMA versions and metadata URLs. 
+This architecture simplifies schema management by eliminating the containerized TAP_SCHEMA database pod and removing the Docker image build cycle for schema updates. 
+Instead of rebuilding containers for every schema change, a lightweight Helm hook job in Repertoire loads YAML schema definitions directly to CloudSQL during Repertoire deployments via ArgoCD. 
+The TAP service connects to CloudSQL for schema metadata queries at runtime, gaining better backup, recovery, and monitoring capabilities. 
+Schema version configuration is managed by Repertoire, which serves as the single source of truth for TAP_SCHEMA versions and metadata URLs. 
 This improves maintenance overhead and decouples TAP service deployments from schema updates.
  
 **Scope:** This architecture applies to both the QServ and the Postgres backed TAP services (tap & ssotap applications).
@@ -50,7 +53,7 @@ management. Every schema update requires rebuilding a Docker image, pushing
 it to a registry, and redeploying pods which is a time-consuming process for 
 what is essentially metadata changes. 
 
-Also container storage is ephemeral, meaning schema data is lost on pod 
+Also container storage is ephemeral, meaning schema data is lost on pod     
 restarts and lacks the backup & recovery, logging and monitoring 
 and robustness capabilities of CloudSQL databases. 
 
@@ -103,7 +106,7 @@ Felis populates these by reading the YAML schema definition (e.g., `yml/dp02_dc2
          ↓
     [Helm pre-upgrade hook]
          ↓
-    [Job: felis-updater] → [CloudSQL Proxy] → [CloudSQL: tap_schema DB]
+    [Job: repertoire update-tap-schema] → [CloudSQL Proxy] → [CloudSQL: tap_schema DB]
          ↓
     [Repertoire Service] ← [CloudSQL Proxy] ← [CloudSQL: tap_schema DB]
          ↓
@@ -173,7 +176,8 @@ tables.
 - More complex logic needed
 
 Incremental updates would be more complex because they would potentially 
-require changes to Felis.
+require changes to Felis, in the case where updates are being done using 
+the felis cli tool.
 
 With Felis, if each schema was loaded individually using `felis load-tap-schema`,
 a rough outline of what this may require could be:
@@ -314,9 +318,14 @@ and would be available publicly, and discoverable via Repertoire.
 
 For our MVP, the current plan is to implement Option D and download from GCS.
 
-### 4.3 Update Script Logic
+### 4.3 Update Logic
 
-The update script (`update-tap-schema.sh`) will perform the following operations:
+We've considered a couple of options here, specifically a shell script which
+calls Felis commands directly, or a Python cli, most likely built into 
+Repertoire which imports felis as a library and performs the update logic.
+
+In either case, the update script will perform the 
+following operations:
 
 #### 1. Fetch Schemas
 
@@ -325,12 +334,11 @@ Based on selected distribution method (see 4.2)
 #### 2. Initialize TAP_SCHEMA Tables
 
 - Creates the standard TAP_SCHEMA tables if they don't exist:
-  - `tap_schema.schemas`
-  - `tap_schema.tables`
-  - `tap_schema.columns`
-  - `tap_schema.keys`
-  - `tap_schema.key_columns`
-- This probably would also be a call to a felis command `init-tap-schema` before we run the updates.
+  - `tap_schema_staging.schemas`
+  - `tap_schema_staging.tables`
+  - `tap_schema_staging.columns`
+  - `tap_schema_staging.keys`
+  - `tap_schema_staging.key_columns`
 - Set up appropriate indexes for query performance
 
 #### 3. Validate Configuration
@@ -342,9 +350,17 @@ Based on selected distribution method (see 4.2)
 
 #### 4. Load Each Schema
 
-For each schema in the configuration:
-- Validates the YAML file using Felis (`felis validate`)
-  - Generates INSERT SQL using `felis load-tap-schema --dry-run --output-file`
+For each schema in the configuration, what we do depends on the update strategy.
+For blue-green, we would:
+- Validate the YAML file
+- Generate INSERT SQL
+- Insert into staging schema (`tap_schema_staging`)
+- Validate staging data
+- If all schemas load successfully, perform atomic swap
+
+In the case of a DELETE + INSERT strategy, we would:
+- Validate the YAML file
+  - Generate INSERT SQL
 - **Execute DELETE + INSERT in a single transaction** (see Section 4.9 for details)
   - Delete existing schema data from all TAP_SCHEMA tables
   - Execute generated INSERT SQL
@@ -353,14 +369,16 @@ For each schema in the configuration:
 
 #### 5. Optional Cleanup
 
-If `CLEANUP_OLD_SCHEMAS` is enabled:
-- Identifies schemas in CloudSQL not in the configured list
-- Removes obsolete schemas and their metadata
+In the case where we decide to go with the DELETE + INSERT strategy, if 
+`CLEANUP_OLD_SCHEMAS` is enabled:
+- Identify schemas in CloudSQL not in the configured list
+- Remove obsolete schemas and their metadata
 
 Whether this is necessary depends on if our full replacement strategy is to 
 delete the metadata for each schema from the TAP_SCHEMA tabless, or to drop 
-TAP_SCHEMA altogether and recreate it from scratch. If we drop and recreate 
-then this step is not needed.
+TAP_SCHEMA altogether and recreate it from scratch, or if we are performing 
+a blue-green deployment. If we drop and recreate or go with the blue-green 
+approach then this step is not needed.
 
 #### 6. Add Version
 
@@ -368,8 +386,8 @@ then this step is not needed.
 
 #### 7. Report Results (Optional)
 
-- Should we include some sort of verification step and report somehow?
-- Perhaps the simplest is to exit with appropriate status code and let the 
+- Perhaps the simplest approach for getting a report of the update 
+  process is to exit with appropriate status code and let the 
   Helm job report success/failure.
 
 **Idempotency:** The script is designed to be idempotent, running it multiple times with the same schema version is safe and should produce the same result.
@@ -389,113 +407,118 @@ Rough draft of the Job template:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: repertoire-schema-update-{{ .Values.tapSchema.schemaVersion | replace "." "-" }}
-  namespace: {{ .Release.Namespace }}
+  name: "repertoire-tap-schema-update"
   annotations:
     helm.sh/hook: "pre-install,pre-upgrade"
-    helm.sh/hook-delete-policy: "before-hook-creation"
-    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: "hook-succeeded"
+    helm.sh/hook-weight: "1"
   labels:
     {{- include "repertoire.labels" . | nindent 4 }}
-    app.kubernetes.io/component: "schema-update"
 spec:
-  ttlSecondsAfterFinished: 86400
-  backoffLimit: 3
   template:
     metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       labels:
         {{- include "repertoire.selectorLabels" . | nindent 8 }}
-        app.kubernetes.io/component: "schema-update"
+        app.kubernetes.io/component: "tap-schema-update"
     spec:
-      serviceAccountName: {{ include "repertoire.serviceAccountName" . }}
-      restartPolicy: OnFailure
-      
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.cloudsql.enabled }}
+      serviceAccountName: "repertoire"
+      {{- else }}
+      automountServiceAccountToken: false
+      {{- end }}
+      containers:
+        - name: "tap-schema-update"
+          command:
+            - "sh"
+            - "-c"
+            - |
+              set -e
+              {{- range $app, $config := .Values.config.tapSchemaApps }}
+              repertoire update-tap-schema --app {{ $app }}
+              {{- end }}
+          env:
+            - name: "DATABASE_PASSWORD"
+              valueFrom:
+                secretKeyRef:
+                  name: "repertoire"
+                  key: "database-password"
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy | quote }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - "all"
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: "config"
+              mountPath: "/etc/repertoire"
+              readOnly: true
+            - name: "tmp"
+              mountPath: "/tmp"
+      {{- if .Values.cloudsql.enabled }}
+      - name: "cloud-sql-proxy"
+        image: "{{ .Values.cloudsql.image.repository }}:{{ .Values.cloudsql.image.tag }}"
+        command:
+          - "/cloud_sql_proxy"
+          - "-ip_address_types=PRIVATE"
+          - "-instances={{ .Values.cloudsql.instanceConnectionName }}=tcp:5432"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - "all"
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+        {{- with .Values.cloudsql.resources }}
+        resources:
+          {{- toYaml . | nindent 12 }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      restartPolicy: "Never"
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
-        fsGroup: 1000
-      containers:
-      - name: felis-updater
-        image: ghcr.io/lsst/felis:{{ .Values.tapSchema.felisVersion | default "1.0.0" }}
-        imagePullPolicy: IfNotPresent
-        
-        command: ["/bin/bash", "/scripts/update-tap-schema.sh"]
-        
-        env:
-        - name: PGHOST
-          value: "127.0.0.1"
-        - name: PGPORT
-          value: "5432"
-        - name: PGDATABASE
-          value: {{ .Values.tapSchema.cloudSqlDatabase | quote }}
-        - name: SCHEMA_VERSION
-          value: {{ .Values.tapSchema.schemaVersion | quote }}
-        - name: SCHEMAS_TO_LOAD
-          value: {{ .Values.tapSchema.schemas | join "," | quote }}
-        - name: CLEANUP_OLD_SCHEMAS
-          value: {{ .Values.tapSchema.cleanupOldSchemas | default "false" | quote }}
-        - name: GCS_BUCKET
-          value: {{ .Values.tapSchema.gcsBucket | default "rubin-tap-schemas" | quote }}
-        - name: GCS_BASE_PATH
-          value: {{ .Values.tapSchema.gcsBasePath | default "schemas" | quote }}
-        volumeMounts:
-        - name: update-script
-          mountPath: /scripts
-          readOnly: true
-        resources:
-          requests:
-            memory: "512Mi"
-            cpu: "250m"
-          limits:
-            memory: "2Gi"
-            cpu: "1000m"
-        
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - all
-          readOnlyRootFilesystem: true
-      
-      # Cloud SQL Proxy sidecar
-      - name: cloud-sql-proxy
-        image: {{ .Values.cloudsql.image.repository }}:{{ .Values.cloudsql.image.tag }}
-        imagePullPolicy: {{ .Values.cloudsql.image.pullPolicy }}
-        
-        args:
-        - "--structured-logs"
-        - "--port=5432"
-        - "--max-sigterm-delay=30s"
-        - {{ .Values.cloudsql.instanceConnectionName | quote }}
-        
-        securityContext:
-          runAsNonRoot: true
-          runAsUser: 65532
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - all
-          readOnlyRootFilesystem: true
-        
-        resources:
-          {{- toYaml .Values.cloudsql.resources | nindent 10 }}
-      
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       volumes:
-      - name: update-script
-        configMap:
-          name: {{ include "repertoire.fullname" . }}-schema-update-script
-          defaultMode: 0755
+        - name: "config"
+          configMap:
+            name: "repertoire"
+        - name: "tmp"
+          emptyDir: {}
 ```
 
 **How it would work:**
 
-1. Developer updates schema version in Phalanx
+1. Developer updates schema version in Phalanx (repertoire values file)
 2. Sync using ArgoCD
 3. Helm hook executes automatically:
    - Helm renders template with new `schemaVersion: "v1.2.4"`
    - `pre-upgrade` hook ensures job runs BEFORE the main deployment updates
    - Job `tap-schema-update-v1-2-4` is created and runs
+   - Job iterates through TAP services and runs the cli update job for each one
    - Job loads schemas to CloudSQL
    - After job succeeds, the main TAP deployment proceeds
 4. Job cleanup:
@@ -512,49 +535,29 @@ following shows a rough draft of the necessary configuration options.
 ```yaml
 # applications/repertoire/values.yaml (base configuration)
 
+# -- Default schema version for all TAP services (can be overridden per-app)
+schemaVersion: "w.2025.43"
 
-tapSchema:
-  # Schema version management is now in Repertoire
-  schemaVersion: "v1.2.3"
-  felisVersion: "1.0.0"
-  schemas:
-    - dp02_dc2
-    - dp1
-  cleanupOldSchemas: false
-  cloudSqlDatabase: "tap_schema" 
-```
+# -- Template for schema artifact URLs (use {schemaVersion} placeholder)
+schemaSourceTemplate: "https://github.com/lsst/sdm_schemas/archive/refs/tags/{version}.tar.gz"
 
-```yaml
-# applications/tap/values.yaml (base configuration)
-
-cloudSQL:
-  enabled: false
-  instanceConnectionName: ""
-  serviceAccount: ""
-  image:
-    repository: ""
-    tag: ""
-    pullPolicy: ""
-
-uws:
-  useCloudSQL: true
-  cloudSqlDatabase: "uws"
-  image:
-    repository: ""
-    pullPolicy: ""
-    tag: ""
+# -- Username for CloudSQL database connections
+# @default -- "repertoire" (matches ServiceAccount name)
+databaseUser: "repertoire"
   
-tapSchema:
-  useCloudSQL: true
-  cloudSqlDatabase: "tap_schema"
-
-  # Keep legacy image config for cases where CloudSQL is not enabled
-  image:
-    repository: ""
-    pullPolicy: ""
-    tag: ""
+# -- TAP schema configuration by application name
+tapSchemaApps:
+  tap:
+    schemas:
+      - dp02_dc2
+      - dp1
+      - ivoa_obscore
+    tapSchemaDatabase: "tap"
+  ssotap:
+    schemas:
+      - dp03
+    tapSchemaDatabase: "ssotap"
 ```
-
 
 #### Environment-Specific Configuration
 
@@ -565,8 +568,8 @@ schemas to load in their respective values files.
 ```yaml
 # applications/repertoire/values-idfint.yaml
 tapSchema:
-  schemaVersion: "v1.2.4"
-  
+  # We can override the schema version per environment if needed
+  schemaVersion: "v1.2.4" 
   # Define which schemas to load in this environment
   schemas:
     - dp02_dc2
@@ -663,18 +666,22 @@ spec:
 ```
 
 ```yaml
-# applications/repertoire/templates/configmap-update-script.yaml
+# applications/repertoire/templates/serviceaccount.yaml
 
+{{- if .Values.config.tapSchemaApps }}
 apiVersion: v1
-kind: ConfigMap
+kind: ServiceAccount
 metadata:
-  name: repertoire-schema-update-script
-  namespace: {{ .Release.Namespace }}
-data:
-  update-tap-schema.sh: |
-{{ .Files.Get "files/update-tap-schema.sh" | indent 4 }}
+  name: {{ include "repertoire.serviceAccountName" . }}
+  labels:
+    {{- include "repertoire.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: "pre-install,pre-upgrade"
+    helm.sh/hook-delete-policy: "before-hook-creation"
+    helm.sh/hook-weight: "0"
+    iam.gke.io/gcp-service-account: {{ required "cloudsql.serviceAccount must be set to a valid Google service account" .Values.cloudsql.serviceAccount | quote }}
+{{- end }}
 ```
-
 
 **Note**: 
 The tap-schema-db deployment and related resources in the cadc-tap chart need to be optional and disabled when CloudSQL is enabled for the tapSchema database.
@@ -765,35 +772,51 @@ felis validate --check-description --check-tap-principal dp02_dc2.yaml
 felis load-tap-schema --engine-url=postgresql://user:pass@host:port/tap_schema dp02_dc2.yaml
 ```
 
-**What We Need to Build in `update-tap-schema.sh`:**
 
-- Download and extract schema files from GitHub releases (or use pre-baked 
-container)
-- Initialize TAP_SCHEMA tables if they don't exist using felis `init-tap-schema`
+### 4.8 Repertoire CLI Implementation
+
+For the MVP we have decided to implement the update logic as a Repertoire 
+CLI command instead of a shell script that calls Felis CLI commands.
+
+The Repertoire CLI tool will import Felis as a Python package, and this 
+provides better error handling, logging, and testability compared to a bash script approach.
+
+#### Example Usage: 
+
+```
+repertoire update-tap-schema --app {{ $app }}
+```
+
+#### Implementation Approach
+
+The Repertoire CLI will:
+
+- Download and extract the schema yaml files from GitHub Releases or GCS
+- Initialize TAP_SCHEMA schemas and tables if they don't exist
+  - tap_schema_staging & tap_schema
 - Parse `SCHEMAS_TO_LOAD` and iterate through schemas
 - For each schema:
   - Validate with felis validate
-  - DELETE existing schema data from all TAP_SCHEMA tables (required because 
-   Felis only INSERTs)
-  - Execute felis load-tap-schema to INSERT new data
+  - Load into staging with felis load-tap-schema
+  - Validate staging data
+- If all schemas load successfully, perform atomic swap (blue-green)
 
-- Transaction management: wrap DELETE + INSERT operations for ALL schemas in a single BEGIN/COMMIT block
-- Cleanup old schemas if CLEANUP_OLD_SCHEMAS is enabled
-- Error handling and reporting
+One thing that needs to be considered is that we currenly use a suffix in 
+the table names in TAP_SCHEMA to indicate the TAP version, in accordance to 
+what is done with the CADC TAP service. We then create views in TAP_SCHEMA 
+for the standard table names (without suffix) that point to the appropriate versioned tables.
 
-**Future Felis Enhancements (Nice to Have):**
+For the MVP we will likely continue with this approach, but in the future
+we may want to evaluate whether this is still necessary or if we can simplify
+the schema management by just having a single set of tables without version suffixes.
 
-`felis load-tap-schema --update-mode=incremental` to update only changed schemas
 
-`felis list-schemas --engine-url=...` to show loaded schemas
+### 4.8.1 Transaction Strategy
 
-`felis remove-schema schema_name --engine-url=...` to remove a schema
-
-### 4.8 Transaction Strategy
-
-Felis manages its own transaction internally when loading schemas. Each `felis load-tap-schema` call commits independently, preventing us from wrapping multiple Felis calls in an outer transaction.
-The workaround suggested here is to use Felis in dry-run mode to generate SQL, 
+If we were to use the felis cli, Felis manages its own transaction internally when loading schemas. Each `felis load-tap-schema` call commits independently, preventing us from wrapping multiple Felis calls in an outer transaction.
+We could handle this by using Felis in dry-run mode to generate SQL, 
 then execute all SQL in a single script-managed transaction:
+
 
 ```bash
 # Phase 1: Clear and repopulate staging
@@ -828,8 +851,10 @@ COMMIT;
 EOF
 ```
 
-Essentially all schemas in `SCHEMAS_TO_LOAD` are updated within a single 
-`BEGIN`...`COMMIT` block.
+However, since we are implementing the update logic as a Repertoire CLI command
+which imports Felis as a library, we can manage the transaction directly in Python.
+Using a database connection from SQLAlchemy, we can wrap the rename operations
+in a single transaction block.
 
 Only the schema rename operations are in a transaction (milliseconds) and data 
 loading happens outside transaction in staging schema, so there would be no 
@@ -840,6 +865,62 @@ If we eventually instead choose to do a full replacement the above would essenti
 be simpler as we would not need to create the staging schema and could just
 delete the existing schema data directly from `tap_schema` before inserting the new data.
 
+### 4.8.2 Transaction concerns
+
+During our architectural review, we identified a potential consistency issue with the blue-green deployment approach. 
+The CADC TAP service's TapSchemaDAO.get() method performs multiple sequential queries to read TAP_SCHEMA metadata without 
+wrapping them in an explicit transaction:
+
+```
+// From TapSchemaDAO.java
+public TapSchema get(int depth) {
+    JdbcTemplate jdbc = new JdbcTemplate(dataSource);
+    
+    // Query 1: schemas
+    List<SchemaDesc> schemaDescs = jdbc.query(gss, new SchemaMapper(...));
+    
+    // Query 2: tables  
+    List<TableDesc> tableDescs = jdbc.query(gts, new TableMapper(...));
+    
+    // Query 3: columns
+    List<ColumnDesc> columnDescs = jdbc.query(gcs, new ColumnMapper());
+    
+    // Query 4: keys
+    List<KeyDesc> keyDescs = jdbc.query(gks, new KeyMapper());
+    
+    // Query 5: key_columns
+    List<KeyColumnDesc> keyColumnDescs = jdbc.query(gkcs, new KeyColumnMapper());
+    
+    // ... combine results and return
+}
+```
+Since Spring's JdbcTemplate uses auto-commit mode by default, each query runs in its own transaction. 
+
+This creates a window where:
+
+TAP service starts reading TAP_SCHEMA (Query 1 reads from version A)
+Blue-green swap COMMIT occurs (schema rename completes)
+TAP service continues reading (Queries 2-5 read from version B)
+Result: Inconsistent metadata, mix of old and new schema data
+
+Critical Window: The swap transaction is very fast (milliseconds). 
+This creates a small but non-zero probability of reading inconsistent data.
+
+If a TAP query receives inconsistent schema metadata, it could 
+potentially reference tables that don't exist in the actual data catalog, 
+use incorrect column types or names, fail with cryptic errors or return 
+incorrect results.
+
+#### Proposed Solutions:
+
+Option 1: Upstream Transaction Fix (Preferred)
+- Modify TapSchemaDAO.get() to wrap all queries in a single transaction and 
+  propose this change upstream to CADC
+
+Option 2:
+- Add a small downtime window during schema swap where TAP service is 
+  paused/restarted. This is less ideal as it impacts availability, but
+  could be a mitigation if we want to ensure zero-risk of inconsistency.
 
 
 ### 4.9 Felis Docker Image
@@ -896,6 +977,8 @@ TAP_SCHEMA will be stored as a Postgres schema in the existing CloudSQL `tap` da
 This approach re-uses existing infrastructure, requires only a single CloudSQL proxy sidecar and keeps maintenance simple. 
 TAP_SCHEMA's small size and infrequent updates mean it won't impact UWS performance.
 If future requirements show the need for complete separation, the `tap_schema` schema can be migrated to a separate database.
+Note that each TAP application (e.g. `tap`, `ssotap`) will have its own 
+CloudSQL instance and database for TAP_SCHEMA.
 
 **Tasks:**
 1. Ensure existing:
@@ -910,16 +993,13 @@ If future requirements show the need for complete separation, the `tap_schema` s
 - Service accounts configured for both TAP and Repertoire (May re-use existing)
 
 
-
-
 ### Phase 2: TAP_SCHEMA Update Mechanism
 
-**Objective:** Implement schema loading and update logic
+**Objective:** Implement schema loading and update logic in Repertoire
 
 **Tasks:**
-1. Verify Felis capabilities and commands
-2. Create `update-tap-schema.sh` script
-3. Implement schema distribution method (Need to choose which option we want 
+1. Create cli in Repertoire for updating TAP_SCHEMA
+2. Implement schema distribution method (Need to choose which option we want 
    to implement first)
 4. Test schema loading in dev environment
 5. Implement validation and error handling
@@ -929,7 +1009,7 @@ If future requirements show the need for complete separation, the `tap_schema` s
 - Schema validation logic
 - Error handling and validate rollback procedures
 
-#### High-Level Flow of `update-tap-schema.sh`:
+#### High-Level Flow of update script:
 
 ```bash
 
@@ -937,18 +1017,16 @@ Parse configuration - Read SCHEMA_VERSION, SCHEMAS_TO_LOAD
 
 Fetch schema files - Download from GCS
 
-Initialize schemas (first time only):
-    felis init-tap-schema --tap-schema-name=tap_schema
-    felis init-tap-schema --tap-schema-name=tap_schema_staging
-
 Validate all schemas - Run felis validate on each YAML file
+
+Initialize tap_schema if not exists
 
 Clear staging schema:
     DELETE all rows from tap_schema_staging tables
 
 Load into staging:
     For each schema in SCHEMAS_TO_LOAD:
-        felis load-tap-schema --tap-schema-name=tap_schema_staging schema.yaml
+        load into tap_schema_staging
 
 Validate staging:
     Verify all expected schemas exist in tap_schema_staging
@@ -1003,8 +1081,10 @@ scratch, the script becomes simpler.
 4. Create release assets:
    - `schemas.tar.gz` OR
    - Pre-baked container image
-5. Deprecate old Docker image build process
-6. Update documentation
+5. Push artifacts to GCS or GHCR
+6. Eventually, deprecate old Docker image build process once all envs have 
+   migrated to new process
+7. Update documentation
 
 **Deliverables:**
 - Updated CI/CD pipeline
@@ -1135,7 +1215,6 @@ Our current design wraps all schemas in a single transaction.
 Are we concerned about transaction size and potential timeouts? TAP service queries against TAP_SCHEMA might be blocked during the entire update?
 Note: This question is only relevant if we choose the single transaction approach instead of blue-green.
 
-
 ### Schema Distribution
 How should the job updater get the schema files? Download from GitHub? Bake into a container image? Mount from ConfigMap?
 I'm thinking start with Option A (GitHub download) for MVP or Option B (baked container) if we want to avoid runtime dependency on GitHub.
@@ -1152,6 +1231,9 @@ I'd probably aim for full replacement for MVP, implement incremental updates as 
 Do we want to maintain schema version history in the database or record the schema version in the database somehow or does 
  that add unnecessary complexity?
 
+### Transaction Safety Resolution
+We need confirmation from CADC about accepting a PR to add 
+transaction wrapping to TAP_SCHEMA reads. If not, we need to decide on a mitigation strategy (downtime window during swap?).
 
 ---
 
